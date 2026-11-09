@@ -1,5 +1,7 @@
 # vWii Ethernet Patcher
 
+## AI has been used for this documenation and analysis
+
 Patches the Wii and vWii IOS so that newer USB ethernet adapters work: AX88772B, AX88772C, AX88772D,
 AX88179 (Nintendo Switch LAN adapter) and AX88179A.
 
