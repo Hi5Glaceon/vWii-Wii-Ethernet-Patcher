@@ -23,9 +23,11 @@ void encrypt_IOS(IOS *ios);
 s32 Init_IOS(IOS **ios);
 void free_IOS(IOS **ios);
 s32 set_content_count(IOS *ios, u32 count);
+bool tmd_is_complete(const signed_blob *s_tmd, u32 size);
 void forge_tmd(signed_blob *s_tmd);
 s32 install_IOS(IOS *ios, bool skipticket);
 s32 get_IOS(IOS **ios, u32 iosnr, u32 revision);
+s32 GetTMD(u64 TicketID, signed_blob **Output, u32 *Length);
 s32 checkIOS(u32 ios_nr);
 
 #endif

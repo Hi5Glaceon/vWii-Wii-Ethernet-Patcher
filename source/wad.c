@@ -27,14 +27,15 @@ typedef struct {
 } ATTRIBUTE_PACKED wadHeader;
 
 
+// reads exactly len bytes at offset; a short file is an error
 s32 __Wad_ReadFile(FILE *fp, void *outbuf, u32 offset, u32 len)
 {
-	s32 ret;
-
-	fseek(fp, offset, SEEK_SET);
-	ret = fread(outbuf, len, 1, fp);
-	if (ret < 0)
-		return ret;
+	if (len == 0)
+		return 0;
+	if (fseek(fp, offset, SEEK_SET) != 0)
+		return -1;
+	if (fread(outbuf, len, 1, fp) != 1)	// fread returns the number of complete blocks: 1 or 0
+		return -1;
 
 	return 0;
 }
@@ -153,7 +154,7 @@ s32 Wad_Read_into_memory(char *filename, IOS **ios, u32 iosnr, u32 revision)
 	else
 		offset += round_up(header->tmd_len, 64);
 
-	if(!IS_VALID_SIGNATURE((signed_blob *)(*ios)->tmd)) 
+	if(!tmd_is_complete((*ios)->tmd, (*ios)->tmd_size))
 	{
 		ret = -1;
 		goto err;
@@ -194,7 +195,9 @@ s32 Wad_Read_into_memory(char *filename, IOS **ios, u32 iosnr, u32 revision)
 			goto err;
 		}
 		
-		ret = __Wad_ReadFile(fp, (*ios)->encrypted_buffer[cnt], offset, (*ios)->buffer_size[cnt]);
+		// the file holds the content padded to 16 bytes (AES), the padding to 64 may be missing at the end
+		memset((*ios)->encrypted_buffer[cnt], 0, (*ios)->buffer_size[cnt]);
+		ret = __Wad_ReadFile(fp, (*ios)->encrypted_buffer[cnt], offset, round_up((u32)content->size, 16));
 		if (ret < 0)		
 		{
 			goto err;

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+  <name>vWii Ethernet Patcher</name>
+  <coder>doworian, Hi5Glaceon_ and contributors</coder>
+  <version>v2.0-beta</version>
+  <release_date>20261109000000</release_date>
+  <short_description>USB ethernet adapters for Wii and vWii</short_description>
+  <long_description>Patches the ETH module of the Wii / vWii IOS for AX88772B, AX88772C, AX88772D, AX88179 (Nintendo Switch LAN adapter) and AX88179A USB ethernet adapters. Dump your IOS with [+] first. Limit the switch / router port of the console to 100M.</long_description>
+  <ahb_access/>
+</app>
