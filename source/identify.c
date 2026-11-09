@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "identify.h"
+#include "platform.h"
 
 static bool apply_patch(char *name, const u8 *old, const u8 *patch, u32 size, bool enable)
 {
@@ -58,10 +59,12 @@ void PatchIOS(bool enable)
 	apply_patch("es_identify", es_identify_old, es_identify_patch, sizeof(es_identify_patch), enable);
 	apply_patch("hash_check", hash_old, hash_patch, sizeof(hash_patch), enable);
 	apply_patch("new_hash_check", new_hash_old, new_hash_patch, sizeof(new_hash_patch), enable);
-	// vWii specific
+	// vWii specific (the patterns do not exist in a Wii IOS, so they are only searched on the vWii)
+	if (plat_is_vwii()) {
 	apply_patch("vwii_patch_ptr1", Kill_AntiSysTitleInstallv3_pt1_old, Kill_AntiSysTitleInstallv3_pt1_patch, sizeof(Kill_AntiSysTitleInstallv3_pt1_patch), enable);
 	apply_patch("vwii_patch_ptr2", Kill_AntiSysTitleInstallv3_pt2_old, Kill_AntiSysTitleInstallv3_pt2_patch, sizeof(Kill_AntiSysTitleInstallv3_pt2_patch), enable);
 	apply_patch("vwii_patch_ptr3", Kill_AntiSysTitleInstallv3_pt3_old, Kill_AntiSysTitleInstallv3_pt3_patch, sizeof(Kill_AntiSysTitleInstallv3_pt3_patch), enable);
+	}
 	write16((vu32)0xCD8B420A, 1); // mem protect on
 }
 

@@ -8,6 +8,7 @@
 #include "rijndael.h"
 #include "sha1.h"
 #include "tools.h"
+#include "platform.h"
 #include "isfs.h"
 #include "memory/mem2.hpp"
 
@@ -157,6 +158,7 @@ void free_IOS(IOS **ios)
 		if ((*ios)->decrypted_buffer) free((*ios)->decrypted_buffer);
 		if ((*ios)->buffer_size) free((*ios)->buffer_size);
 		free(*ios);
+		*ios = NULL; // callers free again after a failed read
 	}
 }
 
@@ -197,7 +199,19 @@ s32 set_content_count(IOS *ios, u32 count)
 	return 0;
 }
 
-s32 install_IOS(IOS *ios, bool skipticket)
+// true if the TMD (size bytes as read from the file) contains all of its content records
+bool tmd_is_complete(const signed_blob *s_tmd, u32 size)
+{
+	if (s_tmd == NULL || size < 4 || !IS_VALID_SIGNATURE(s_tmd))
+		return false;
+	if (size < SIGNATURE_SIZE(s_tmd) + sizeof(tmd))
+		return false;
+	tmd *t = (tmd *)SIGNATURE_PAYLOAD(s_tmd);
+	return SIGNATURE_SIZE(s_tmd) + TMD_SIZE(t) <= size;
+}
+
+// the install itself: ticket, TMD and every content to ES (code of the original tool)
+static s32 install_title(IOS *ios, bool skipticket)
 {
 	int ret;
 	int cfd;
@@ -257,16 +271,54 @@ s32 install_IOS(IOS *ios, bool skipticket)
 	return 0;
 }
 
-// try sd wad first, then fall back to nand
+// install_title() has to set the common key index of the ticket to 0 (the contents are encrypted with
+// the Wii common key), so ES stores a changed ticket. Afterwards the original ticket is put back, so e.g.
+// the vWii ticket keeps its key index 2. This is also done when the install fails, because the ticket is
+// already written at that point (an aborted install keeps the old IOS, but not the old ticket).
+s32 install_IOS(IOS *ios, bool skipticket)
+{
+	u8 *orig = NULL;
+	if (!skipticket)
+	{
+		if (ios->ticket == NULL || ios->ticket_size <= 0x1F1)
+			return -1;
+		orig = MEM2_memalign(32, (ios->ticket_size + 31) & ~31u);
+		if (orig == NULL)
+			return -1;		// without a copy the original ticket could not be put back: do not start
+		memcpy(orig, ios->ticket, ios->ticket_size);
+	}
+
+	s32 ret = install_title(ios, skipticket);
+
+	if (orig != NULL && memcmp(orig, ios->ticket, ios->ticket_size) != 0)
+	{
+		s32 r = ES_AddTicket((signed_blob *)orig, ios->ticket_size, ios->certs, ios->certs_size, ios->crl, ios->crl_size);
+		if (r < 0)
+		{
+			printf("  warning: original ticket not put back (%d)\n", (int)r);
+			write_log("install: original ticket not put back (%d)", (int)r);
+		}
+	}
+	if (orig != NULL)
+		free(orig);
+	return ret;
+}
+
+// try sd wad first (stock backup of this console, then the old sd:/wad/ names), then the nand
 s32 get_IOS(IOS **ios, u32 iosnr, u32 revision)
 {
-	char buf[64];
+	char buf[80];
 	int ret;
 	ret = Init_SD();
 	if(ret >= 0)
 	{
-		sprintf(buf, "sd:/wad/IOS%u-64-v%u.wad", iosnr, revision);
+		sprintf(buf, "%s/IOS%u-64-v%u.wad", plat_wad_dir(), iosnr, revision);
 		ret = Wad_Read_into_memory(buf, ios, iosnr, revision);
+		if(ret < 0)
+		{
+			sprintf(buf, "sd:/wad/IOS%u-64-v%u.wad", iosnr, revision);
+			ret = Wad_Read_into_memory(buf, ios, iosnr, revision);
+		}
 		if(ret < 0)
 		{
 			sprintf(buf, "sd:/wad/IOS%u-64-v%u.wad.out.wad", iosnr, revision);
@@ -320,7 +372,7 @@ s32 checkTitle(u64 title_id)
 
     if (ret == 0) {
 		t = (tmd*)SIGNATURE_PAYLOAD(TMD);
-        return t->title_version;
+        ret = t->title_version;
     } else {
 		ret = -2;
 	}

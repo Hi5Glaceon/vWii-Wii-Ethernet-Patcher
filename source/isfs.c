@@ -5,6 +5,7 @@
 #include "isfs.h"
 #include "sha1.h"
 #include "memory/mem2.hpp"
+#include "tools.h"
 
 #define round_up(x,n)	(-(-(x) & -(n)))
 #define TITLE_UPPER(x)		((u32)((x) >> 32))
@@ -33,8 +34,14 @@ void *Nand_get_file(const char *nand_file, size_t *size)
 			buf = MEM2_memalign(32, stats.file_length);
 			if(buf != NULL)
 			{
-				*size = stats.file_length;
-				ISFS_Read(fd, (char*)buf, *size);
+				// only a complete read counts, otherwise the caller gets NULL
+				if(ISFS_Read(fd, (char*)buf, stats.file_length) == (s32)stats.file_length)
+					*size = stats.file_length;
+				else
+				{
+					free(buf);
+					buf = NULL;
+				}
 			}
 		}
 		ISFS_Close(fd);
@@ -82,7 +89,7 @@ s32 Nand_Read_into_memory(IOS **ios, u32 iosnr, u32 revision)
 	(*ios)->crl_size = 0;
 	sprintf(NandFile, "/title/00000001/%08x/content/title.tmd", iosnr);
 	(*ios)->tmd = Nand_get_file(NandFile, &((*ios)->tmd_size));
-	if((*ios)->tmd == NULL || (*ios)->tmd_size == 0)
+	if(!tmd_is_complete((*ios)->tmd, (*ios)->tmd_size))
 	{
 		ret = -1;
 		goto error;
@@ -128,12 +135,19 @@ s32 Nand_Read_into_memory(IOS **ios, u32 iosnr, u32 revision)
 	TMD_Content = TMD_CONTENTS(TMD);
 	for(count = 0; count < TMD->num_contents; count++)
 	{
-		sprintf(NandFile, "/title/00000001/%08x/content/%08x.app", iosnr, TMD_Content[count].cid);
-		tmp_buf = Nand_get_file(NandFile, &content_size);
+		// a shared content always comes from /shared1: a private file with the same cid is a
+		// leftover of an earlier patched install (the patch makes the module a private content)
+		tmp_buf = NULL;
+		if(!(TMD_Content[count].type & 0x8000))
+		{
+			sprintf(NandFile, "/title/00000001/%08x/content/%08x.app", iosnr, TMD_Content[count].cid);
+			tmp_buf = Nand_get_file(NandFile, &content_size);
+		}
 		if(tmp_buf == NULL)
 			tmp_buf = Nand_get_from_content(TMD_Content[count].hash, &content_size, cm, content_map_items);
 		if(tmp_buf == NULL)
 		{
+			write_log("IOS%u: content #%u not found on the NAND", iosnr, (unsigned)count);
 			ret = -1;
 			goto error;
 		}
@@ -158,6 +172,7 @@ s32 Nand_Read_into_memory(IOS **ios, u32 iosnr, u32 revision)
 		SHA1((*ios)->decrypted_buffer[count], TMD_Content[count].size, hash);
 		if(memcmp(TMD_Content[count].hash, hash, sizeof(hash)))
 		{
+			write_log("IOS%u: content #%u does not match the TMD (not stock)", iosnr, (unsigned)count);
 			ret = -1;
 			goto error;
 		}

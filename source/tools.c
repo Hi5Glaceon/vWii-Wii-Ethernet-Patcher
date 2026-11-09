@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <fat.h>
 #include <sdcard/wiisd_io.h>
 #include "tools.h"
@@ -34,6 +35,19 @@ void waitforbuttonpress(u32 *out, u32 *outGC)
 			return;
 		}
 	}
+}
+
+// one line per call to the log file, closed every time so the log survives a crash
+void write_log(const char *fmt, ...)
+{
+	FILE *f = fopen(LOG_FILE, "ab");
+	if (!f) return;
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fputc('\n', f);
+	fclose(f);
 }
 
 s32 Init_SD()
