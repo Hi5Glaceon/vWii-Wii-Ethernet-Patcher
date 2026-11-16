@@ -8,8 +8,6 @@
 #include "rijndael.h"
 #include "sha1.h"
 #include "tools.h"
-#include "platform.h"
-#include "isfs.h"
 #include "memory/mem2.hpp"
 
 #define round_up(x,n)	(-(-(x) & -(n)))
@@ -17,8 +15,6 @@
 #define TITLE_LOWER(x)		((u32)(x))
 
 u8 commonkey[16] = { 0xeb, 0xe4, 0x2a, 0x22, 0x5e, 0x85, 0x93, 0xe4, 0x48, 0xd9, 0xc5, 0x45, 0x73, 0x81, 0xaa, 0xf7 };
-
-s32 Wad_Read_into_memory(char *filename, IOS **ios, u32 iosnr, u32 revision);
 
 void get_title_key(signed_blob *s_tik, u8 *key)
 {
@@ -85,6 +81,15 @@ void encrypt_buffer(u16 index, u8 *source, u8 *dest, u32 len)
 	aes_encrypt(iv, source, dest, len);
 }
 
+// Every content is encrypted with its index from the TMD as IV. In a stock IOS the index is the
+// same as the position in the content list, but not in every cIOS: d2x lists some contents in
+// another order (e.g. IOS249: the content at position 3 has index 17 and the one at 17 has index 3).
+static u16 content_index(IOS *ios, int position)
+{
+	tmd *tmd_data = (tmd *)SIGNATURE_PAYLOAD(ios->tmd);
+	return tmd_data->contents[position].index;
+}
+
 void decrypt_IOS(IOS *ios)
 {
 	u8 key[16];
@@ -94,7 +99,7 @@ void decrypt_IOS(IOS *ios)
 	int i;
 	for (i = 0; i < ios->content_count; i++)
 	{
-		decrypt_buffer(i, ios->encrypted_buffer[i], ios->decrypted_buffer[i], ios->buffer_size[i]);
+		decrypt_buffer(content_index(ios, i), ios->encrypted_buffer[i], ios->decrypted_buffer[i], ios->buffer_size[i]);
 	}
 }
 
@@ -107,7 +112,7 @@ void encrypt_IOS(IOS *ios)
 	int i;
 	for (i = 0; i < ios->content_count; i++)
 	{
-		encrypt_buffer(i, ios->decrypted_buffer[i], ios->encrypted_buffer[i], ios->buffer_size[i]);
+		encrypt_buffer(content_index(ios, i), ios->decrypted_buffer[i], ios->encrypted_buffer[i], ios->buffer_size[i]);
 	}
 }
 
@@ -301,33 +306,6 @@ s32 install_IOS(IOS *ios, bool skipticket)
 	}
 	if (orig != NULL)
 		free(orig);
-	return ret;
-}
-
-// try sd wad first (stock backup of this console, then the old sd:/wad/ names), then the nand
-s32 get_IOS(IOS **ios, u32 iosnr, u32 revision)
-{
-	char buf[80];
-	int ret;
-	ret = Init_SD();
-	if(ret >= 0)
-	{
-		sprintf(buf, "%s/IOS%u-64-v%u.wad", plat_wad_dir(), iosnr, revision);
-		ret = Wad_Read_into_memory(buf, ios, iosnr, revision);
-		if(ret < 0)
-		{
-			sprintf(buf, "sd:/wad/IOS%u-64-v%u.wad", iosnr, revision);
-			ret = Wad_Read_into_memory(buf, ios, iosnr, revision);
-		}
-		if(ret < 0)
-		{
-			sprintf(buf, "sd:/wad/IOS%u-64-v%u.wad.out.wad", iosnr, revision);
-			ret = Wad_Read_into_memory(buf, ios, iosnr, revision);
-		}
-		Close_SD();
-	}
-	if(ret < 0)
-		ret = Nand_Read_into_memory(ios, iosnr, revision);
 	return ret;
 }
 

@@ -8,6 +8,7 @@
 #include "platform.h"
 #include "patch_179.h"
 #include "IOSPatcher.h"
+#include "cios.h"
 
 // the chip revision register
 #define LT_CHIPREVID (*(vu32 *)0xCD8005A0)
@@ -39,11 +40,12 @@ const char *plat_wad_dir(void)
     return "sd:/wad/wii";
 }
 
-u32 plat_ios[32];
+u32 plat_ios[PLAT_MAX_IOS];
 u32 plat_ios_count = 0;
 
 // Makes the IOS list of this console from the list in patch_179.c.
 // IOS59 only exists on the Wii U. A Wii only lists it if it is installed after all.
+// At the end come the cIOS slots 248 to 251 that are installed (see cios.c).
 void plat_init(void)
 {
     plat_ios_count = 0;
@@ -54,9 +56,11 @@ void plat_init(void)
         if (iosnr == 59 && !plat_is_vwii() && checkIOS(iosnr) < 0)
             continue;            // Wii without IOS59
 
-        if (plat_ios_count < 32) {
+        if (plat_ios_count < PLAT_MAX_IOS) {
             plat_ios[plat_ios_count] = iosnr;
             plat_ios_count++;
         }
     }
+
+    cios_add_installed_slots(plat_ios, &plat_ios_count, PLAT_MAX_IOS);
 }

@@ -64,6 +64,7 @@ static const ax179_module_t modules[MODULE_COUNT] = {
 };
 
 // every IOS that has one of the four modules, in the order they are patched
+// (the cIOS of USB loaders carry them too; their slots are added by cios.c)
 const u32 ax179_supported_ios[] = {
     31, 33, 34, 35, 36, 37, 38,
     41, 43, 45, 46, 48,
@@ -83,6 +84,29 @@ bool ax179_is_stock_eth_hash(const u8 *sha1)
 {
     for (int m = 0; m < MODULE_COUNT; m++) {
         if (same_hash(sha1, modules[m].orig_sha1))
+            return true;
+    }
+    return false;
+}
+
+bool ax179_is_stock_ios36_eth_hash(const u8 *sha1)
+{
+    return same_hash(sha1, ax179_ios36_orig_sha1);
+}
+
+bool ax179_is_patched_eth_hash(const u8 *sha1)
+{
+    for (int m = 0; m < MODULE_COUNT; m++) {
+        if (same_hash(sha1, modules[m].new_sha1))
+            return true;
+    }
+    return false;
+}
+
+bool ax179_is_eth_size(u32 size)
+{
+    for (int m = 0; m < MODULE_COUNT; m++) {
+        if (size == modules[m].size)
             return true;
     }
     return false;

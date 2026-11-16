@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <ogcsys.h>
 #include <gccore.h>
@@ -52,16 +53,17 @@
 #include "platform.h"
 #include "sigcheck.h"
 #include "backup.h"
+#include "cios.h"
 
 extern void __exception_setreload(int t);
 
-#define VERSION "v2.0-beta"
+#define VERSION "v2.1-beta"
 
 // the IOS this tool runs on
 #define IOS58_NR 58
 
-// size of all IOS lists (there are 20 IOS with an ETH module)
-#define MAX_IOS 32
+// size of all IOS lists (20 IOS with an ETH module and up to 4 cIOS, see platform.c)
+#define MAX_IOS PLAT_MAX_IOS
 
 // USB IDs of the adapters
 #define ASIX_VID 0x0B95
@@ -74,18 +76,21 @@ extern void __exception_setreload(int t);
 #define AX179A_HINT_1 "Tip: limit the switch / router port of this console to 100M."
 #define AX179A_HINT_2 "With the AX88179A gigabit links were unreliable in tests."
 
-// results of do_patch_179()
+// results of do_patch_179() and patch_772_and_install()
 #define PATCH_DONE           0    // patched (and installed, or written to the SD card)
 #define PATCH_ALREADY_DONE   1    // the IOS already has the AX88179 driver
 #define PATCH_NO_MODULE      2    // the IOS has no ETH module this tool knows
 #define PATCH_NO_BACKUP      3    // no backup on the SD card fits the IOS on the NAND
 #define PATCH_NOT_INSTALLED -3    // the IOS is not on the NAND
+#define PATCH_NO_WAY_BACK   -4    // the patched IOS could not be restored afterwards, not installed
+#define PATCH_WRONG_MODULE  -5    // AX88772D: not the ETH module the patch was made for, not installed
                                   // any other negative number: an error
 
 // results of dump_single_ios()
 #define DUMP_STOCK           0    // saved as IOSn-64-vV.wad
 #define DUMP_MODIFIED        2    // patched IOS on the NAND, not saved
 #define DUMP_CUSTOM          3    // saved as IOSn-64-vV-custom.wad
+#define DUMP_CIOS            4    // saved as IOSn-64-vV-cios.wad
 #define DUMP_ERROR          -1
 
 
@@ -125,13 +130,23 @@ static u32 get_button(void)
     return pressed;
 }
 
-// prints a list like "IOS31, IOS33, IOS34"
+// prints a list like "IOS31, IOS33, IOS34"; a long list goes on in the next line after a comma,
+// never in the middle of a name
 static void print_ios_list(const u32 *list, int count)
 {
+    int cols = 80, rows = 0, col = 0, row = 0;
+    CON_GetMetrics(&cols, &rows);
+
     for (int i = 0; i < count; i++) {
-        printf("IOS%u", list[i]);
-        if (i < count - 1)
-            printf(", ");
+        char item[16];
+        snprintf(item, sizeof(item), "IOS%u%s", list[i], (i < count - 1) ? "," : "");
+
+        CON_GetPosition(&col, &row);
+        if (col > 0 && col + (int)strlen(item) + 1 >= cols)
+            printf("\n");
+        else if (i > 0)
+            printf(" ");
+        printf("%s", item);
     }
 }
 
@@ -287,6 +302,32 @@ static bool find_asix_device(usb_device_entry *found)
     return false;
 }
 
+// Reads the version (bcdDevice) of a device that has its own USB ID (AX88772, AX88772B / C): it tells
+// the AX88772B (1.00) from the AX88772C (2.00). The device descriptor can only be read from an
+// opened device (USB_GetDeviceDescription wants the handle from USB_OpenDevice, not the device ID).
+// Only done once per device, like read_1790_info().
+static void read_version(s32 device_id, u16 vid, u16 pid)
+{
+    if (device_id == read_device_id && adapter_read_ok)
+        return;
+
+    read_device_id = -1;
+    adapter_read_ok = false;
+    adapter_bcd = 0;
+
+    s32 fd = -1;
+    if (USB_OpenDevice(device_id, vid, pid, &fd) < 0)
+        return;
+
+    usb_devdesc desc ATTRIBUTE_ALIGN(32);
+    if (read_descriptor(fd, &desc)) {
+        adapter_bcd = desc.bcdDevice;
+        adapter_read_ok = true;
+        read_device_id = device_id;
+    }
+    USB_CloseDevice(&fd);
+}
+
 // Looks for an adapter and fills adapter_pid, adapter_bcd and adapter_product.
 static void detect_adapter(void)
 {
@@ -306,11 +347,7 @@ static void detect_adapter(void)
         // (if this device was read before, the version and the name simply stay as they are)
         read_1790_info(device.device_id);
     } else {
-        usb_devdesc desc ATTRIBUTE_ALIGN(32);
-        adapter_bcd = 0;
-        if (read_descriptor(device.device_id, &desc))
-            adapter_bcd = desc.bcdDevice;
-        read_device_id = -1;
+        read_version(device.device_id, device.vid, device.pid);
     }
 }
 
@@ -374,7 +411,8 @@ static const char *adapter_name(void)
         return "AX88772 (stock)";
 
     if (adapter_pid == PID_772B) {
-        if (adapter_bcd == 0x0002)
+        // the AX88772C has version 2.00 (read_version(); the two bytes may come in either order, like the AX88179's 1.00)
+        if (adapter_bcd == 0x0002 || adapter_bcd == 0x0200)
             return "AX88772C";
         return "AX88772B";
     }
@@ -409,7 +447,7 @@ static const char *adapter_name(void)
 // One entry per IOS in plat_ios[] (see platform.c), filled by refresh_status().
 typedef struct {
     s32 version;      // -1 if the IOS is not installed
-    int signature;    // SIG_NINTENDO (stock), SIG_FAKE (MODIFIED) or SIG_OTHER (custom)
+    int signature;    // SIG_NINTENDO (stock), SIG_FAKE (MODIFIED), SIG_OTHER (custom) or SIG_CIOS (cIOS)
     int backup;       // which backup on the SD card fits (BK_...), BK_NONE if none fits
 } ios_info;
 
@@ -435,7 +473,7 @@ static u32 tmd_version(const signed_blob *tmd_data)
     return t->title_version;
 }
 
-// "stock", "MODIFIED", "custom" or "missing"
+// "stock", "MODIFIED", "custom", "cIOS" or "missing"
 static const char *state_name(const ios_info *info)
 {
     if (info->version < 0)
@@ -460,7 +498,7 @@ static void refresh_status(void)
             continue;             // not installed
 
         info->version = tmd_version(tmd_data);
-        info->signature = tmd_sig_class(tmd_data, len);
+        info->signature = ios_sig_class(iosnr, tmd_data, len);
 
         backup_match match;
         if (backup_find(iosnr, (u32)info->version, tmd_data, &match) == 0)
@@ -476,6 +514,16 @@ static void refresh_status(void)
 static bool backup_missing(const ios_info *info)
 {
     return info->version >= 0 && info->backup == BK_NONE;
+}
+
+// true if the IOS list of this console has a cIOS (then the screens explain the word "cIOS")
+static bool list_has_cios(void)
+{
+    for (u32 k = 0; k < plat_ios_count; k++) {
+        if (cios_is_slot(plat_ios[k]))
+            return true;
+    }
+    return false;
 }
 
 
@@ -504,18 +552,21 @@ static u32 round_up_64(u32 value)
 }
 
 // writes data and fills it up with zeros to a multiple of 64 bytes
-static void write_padded(FILE *fp, const void *data, u32 len)
+static bool write_padded(FILE *fp, const void *data, u32 len)
 {
     static const u8 zeros[64];
 
-    fwrite(data, 1, len, fp);
+    bool ok = fwrite(data, 1, len, fp) == len;
 
     u32 pad = round_up_64(len) - len;
-    if (pad > 0)
-        fwrite(zeros, 1, pad, fp);
+    if (pad > 0 && fwrite(zeros, 1, pad, fp) != pad)
+        ok = false;
+    return ok;
 }
 
-// writes an IOS (already encrypted) as a WAD file. 0 ok, -1 the file could not be created
+// writes an IOS (already encrypted) as a WAD file. 0 ok, -1 the file could not be created,
+// -2 writing failed (SD card full or a write error): the incomplete file is deleted again, so a
+// cut-off file is never taken for a backup
 static s32 write_wad_file(const char *path, IOS *ios)
 {
     u32 data_size = 0;
@@ -536,18 +587,29 @@ static s32 write_wad_file(const char *path, IOS *ios)
     if (fp == NULL)
         return -1;
 
-    write_padded(fp, &header, sizeof(header));
-    write_padded(fp, ios->certs, ios->certs_size);
+    bool ok = write_padded(fp, &header, sizeof(header));
+    ok = write_padded(fp, ios->certs, ios->certs_size) && ok;
     if (ios->crl != NULL && ios->crl_size > 0)
-        write_padded(fp, ios->crl, ios->crl_size);
-    write_padded(fp, ios->ticket, ios->ticket_size);
-    write_padded(fp, ios->tmd, ios->tmd_size);
+        ok = write_padded(fp, ios->crl, ios->crl_size) && ok;
+    ok = write_padded(fp, ios->ticket, ios->ticket_size) && ok;
+    ok = write_padded(fp, ios->tmd, ios->tmd_size) && ok;
 
     // the encrypted buffers are already a multiple of 64 bytes long
-    for (int i = 0; i < ios->content_count; i++)
-        fwrite(ios->encrypted_buffer[i], 1, round_up_64(ios->buffer_size[i]), fp);
+    for (int i = 0; i < ios->content_count; i++) {
+        u32 size = round_up_64(ios->buffer_size[i]);
+        if (fwrite(ios->encrypted_buffer[i], 1, size, fp) != size)
+            ok = false;
+    }
 
-    fclose(fp);
+    // fclose() writes what is still in the buffer, so a full card can show up only here
+    if (fclose(fp) != 0)
+        ok = false;
+
+    if (!ok) {
+        remove(path);
+        write_log("writing %s failed (SD card full?), file deleted", path);
+        return -2;
+    }
     return 0;
 }
 
@@ -570,8 +632,9 @@ static void make_wad_dirs(void)
 // Saves one IOS from the NAND to the SD card:
 //   - a stock IOS goes to IOSn-64-vV.wad
 //   - a custom IOS (changed by another tool, e.g. WiiLink) goes to IOSn-64-vV-custom.wad
+//   - a cIOS of a USB loader goes to IOSn-64-vV-cios.wad
 //   - a MODIFIED IOS (patched) is never saved, so a good backup is never replaced by a patched one
-// Returns DUMP_STOCK, DUMP_CUSTOM, DUMP_MODIFIED or DUMP_ERROR.
+// Returns DUMP_STOCK, DUMP_CUSTOM, DUMP_CIOS, DUMP_MODIFIED or DUMP_ERROR.
 static s32 dump_single_ios(u32 iosnr)
 {
     s32 version = checkIOS(iosnr);
@@ -586,7 +649,7 @@ static s32 dump_single_ios(u32 iosnr)
         return DUMP_ERROR;
     }
 
-    int signature = tmd_sig_class(ios->tmd, ios->tmd_size);
+    int signature = ios_sig_class(iosnr, ios->tmd, ios->tmd_size);
     if (signature == SIG_FAKE) {
         free_IOS(&ios);
         return DUMP_MODIFIED;
@@ -595,6 +658,8 @@ static s32 dump_single_ios(u32 iosnr)
     int kind = BK_CUSTOM;
     if (signature == SIG_NINTENDO)
         kind = BK_STOCK;
+    else if (signature == SIG_CIOS)
+        kind = BK_CIOS;
 
     char path[96];
     backup_path(path, sizeof(path), kind, iosnr, (u32)version);
@@ -607,6 +672,8 @@ static s32 dump_single_ios(u32 iosnr)
         return DUMP_ERROR;
     if (kind == BK_STOCK)
         return DUMP_STOCK;
+    if (kind == BK_CIOS)
+        return DUMP_CIOS;
     return DUMP_CUSTOM;
 }
 
@@ -669,6 +736,7 @@ static void dump_all_ios(void)
 
     int stock = count_results(results, total, DUMP_STOCK);
     int custom = count_results(results, total, DUMP_CUSTOM);
+    int cios = count_results(results, total, DUMP_CIOS);
     int failed = count_results(results, total, DUMP_ERROR);
 
     // clear the "Current: IOSxx" line
@@ -682,13 +750,25 @@ static void dump_all_ios(void)
         printf("Dumping IOS to %s/ ... %d failed.   ", plat_wad_dir(), failed);
 
     move_cursor(3, 1);
-    printf("%d dumped (%d stock, %d custom).", stock + custom, stock, custom);
+    if (cios > 0)
+        printf("%d dumped (%d stock, %d custom, %d cIOS).", stock + custom + cios, stock, custom, cios);
+    else
+        printf("%d dumped (%d stock, %d custom).", stock + custom, stock, custom);
 
     print_dump_list("Custom (not signed by Nintendo, e.g. WiiLink), saved as *-custom.wad: ", results, DUMP_CUSTOM);
-    print_dump_list("Modified on NAND, NOT dumped (existing backups kept): ", results, DUMP_MODIFIED);
+    print_dump_list("cIOS (USB loader), saved as *-cios.wad: ", results, DUMP_CIOS);
+    print_dump_list("Patched on NAND, NOT dumped (a dump now would be no backup): ", results, DUMP_MODIFIED);
+
+    // a patched IOS without any backup cannot be brought back from the SD card: say where to look
+    for (int i = 0; i < total; i++) {
+        if (results[i] == DUMP_MODIFIED && backup_missing(&ios_state[i])) {
+            printf("\nSome of them have no backup: see \"No backup\" in the README.");
+            break;
+        }
+    }
     print_dump_list("Failed: ", results, DUMP_ERROR);
     if (failed > 0)
-        printf("\n(details in " LOG_FILE ")");
+        printf("\n(details in " LOG_FILE "; is the SD card full?)");
     printf("\n");
     press_any_button();
 }
@@ -704,13 +784,15 @@ typedef struct {
 } restore_job;
 
 // Looks at every MODIFIED (patched) IOS and finds its backup:
-//   - the backup it was made from (stock or custom), or
+//   - the backup it was made from (stock, custom or cIOS), or
 //   - if another tool changed more than the ETH module: a stock backup of the same version.
-// Fills jobs[] and returns how many were found. *missing = MODIFIED IOS without any backup.
-static int find_restore_backups(restore_job *jobs, int *missing)
+// Fills jobs[] and returns how many were found. *missing = MODIFIED IOS without any backup,
+// *copies = how many of them only have a patched copy on the SD card (a dump made after patching).
+static int find_restore_backups(restore_job *jobs, int *missing, int *copies)
 {
     int count = 0;
     *missing = 0;
+    *copies = 0;
 
     for (u32 i = 0; i < plat_ios_count; i++) {
         u32 iosnr = plat_ios[i];
@@ -721,12 +803,13 @@ static int find_restore_backups(restore_job *jobs, int *missing)
             continue;                 // not installed
 
         u32 version = tmd_version(tmd_data);
-        if (tmd_sig_class(tmd_data, len) != SIG_FAKE) {
+        if (ios_sig_class(iosnr, tmd_data, len) != SIG_FAKE) {
             free(tmd_data);
-            continue;                 // stock or custom: nothing to restore
+            continue;                 // stock, custom or a cIOS nobody patched: nothing to restore
         }
 
         backup_match match;
+        char copy[80];
         bool found = false;
         if (backup_find(iosnr, version, tmd_data, &match) == 0) {
             printf(" IOS%-3u v%-5u -> %s backup (state before patching)\n",
@@ -736,6 +819,12 @@ static int find_restore_backups(restore_job *jobs, int *missing)
             printf(" IOS%-3u v%-5u -> stock backup (changed by another tool, FULL stock restore)\n",
                    iosnr, (unsigned)version);
             found = true;
+        } else if (backup_find_patched_copy(iosnr, version, copy, sizeof(copy)) == 0) {
+            printf(" IOS%-3u v%-5u -> only a PATCHED copy on SD (no backup)\n",
+                   iosnr, (unsigned)version);
+            write_log("IOS%u: %s is a patched copy, not a backup", iosnr, copy);
+            (*missing)++;
+            (*copies)++;
         } else {
             printf(" IOS%-3u v%-5u -> no matching backup in %s/\n",
                    iosnr, (unsigned)version, plat_wad_dir());
@@ -776,14 +865,17 @@ static void restore_stock_ios(void)
 {
     restore_job jobs[MAX_IOS];
     int missing;
+    int copies;
 
     clear_screen();
     printf("Restore IOS from %s/\n\n", plat_wad_dir());
     Init_SD();
-    int count = find_restore_backups(jobs, &missing);
+    int count = find_restore_backups(jobs, &missing, &copies);
 
     if (count == 0) {
-        if (missing > 0)
+        if (copies > 0)
+            printf("\nNothing to restore. A patched copy is no backup: see \"No backup\" in README.\n");
+        else if (missing > 0)
             printf("\nNothing to restore (no MODIFIED IOS with a matching backup).\n");
         else
             printf("\nNothing to restore (no MODIFIED IOS).\n");
@@ -850,7 +942,9 @@ static IOS *read_backup(u32 iosnr, u32 version, const signed_blob *nand_tmd, bac
 // tells which backup the patch is made from (shown in the dry run)
 static void print_patch_base(const backup_match *match, bool custom)
 {
-    if (match->kind == BK_CUSTOM || (match->kind == BK_LEGACY && custom))
+    if (match->kind == BK_CIOS)
+        printf("  base: cIOS backup - the changes of the cIOS are kept\n");
+    else if (match->kind == BK_CUSTOM || (match->kind == BK_LEGACY && custom))
         printf("  base: custom backup (not signed by Nintendo) - its changes are kept\n");
     else if (match->kind == BK_LEGACY)
         printf("  base: stock (old sd:/wad/) backup\n");
@@ -858,12 +952,15 @@ static void print_patch_base(const backup_match *match, bool custom)
         printf("  base: stock backup\n");
 }
 
-// Writes the patched IOS of the dry run to <wad folder>/ax179/. A custom IOS has "-custom" in its name.
-static s32 write_dry_run_wad(IOS *ios, u32 iosnr, u32 version, bool custom)
+// Writes the patched IOS of the dry run to <wad folder>/ax179/. A custom IOS has "-custom" in its
+// name, a cIOS "-cios".
+static s32 write_dry_run_wad(IOS *ios, u32 iosnr, u32 version, int base_kind, bool custom)
 {
     char path[96];
     const char *suffix = "";
-    if (custom)
+    if (base_kind == BK_CIOS)
+        suffix = "-cios";
+    else if (custom)
         suffix = "-custom";
 
     Init_SD();
@@ -873,8 +970,8 @@ static s32 write_dry_run_wad(IOS *ios, u32 iosnr, u32 version, bool custom)
 }
 
 // Patches one IOS for the AX88179. The patch is always made from the backup on the SD card that
-// fits the IOS on the NAND, never from the NAND itself. (A custom IOS such as the one of WiiLink
-// keeps its changes, because its custom backup is used.)
+// fits the IOS on the NAND, never from the NAND itself. (A custom IOS such as the one of WiiLink,
+// or a cIOS, keeps its changes, because its own backup is used.)
 // install = false: dry run, the result is written to the SD card
 // install = true:  the result is installed
 // Returns one of the PATCH_... values, or a negative number on an error.
@@ -896,7 +993,10 @@ static s32 do_patch_179(u32 iosnr, bool install)
     IOS *ios = read_backup(iosnr, version, nand_tmd, &match);
     free(nand_tmd);
     if (ios == NULL) {
+        char copy[80];
         printf("  No backup in %s/ matches IOS%u v%u on the NAND.\n", plat_wad_dir(), iosnr, (unsigned)version);
+        if (backup_find_patched_copy(iosnr, version, copy, sizeof(copy)) == 0)
+            printf("  %s is a copy of a PATCHED IOS, not a backup.\n", copy);
         printf("  Patching is disabled until it exists: dump with [+] first.\n");
         return PATCH_NO_BACKUP;
     }
@@ -920,7 +1020,7 @@ static s32 do_patch_179(u32 iosnr, bool install)
     if (install)
         ret = install_IOS(ios, false);
     else
-        ret = write_dry_run_wad(ios, iosnr, version, custom);
+        ret = write_dry_run_wad(ios, iosnr, version, match.kind, custom);
 
     free_IOS(&ios);
     return ret;
@@ -980,6 +1080,11 @@ static void draw_select_menu(int cursor)
     printf("custom = not signed by Nintendo (e.g. WiiLink), changes are kept");
     move_cursor(help_row + 2, 0);
     printf("IOS%u = System Menu, asked for separately before it is installed", AX179_SYSMENU_IOS);
+    if (list_has_cios()) {
+        help_row++;                           // one more line, the rest moves down
+        move_cursor(help_row + 2, 0);
+        printf("cIOS = IOS of a USB loader, not selected at the start");
+    }
     move_cursor(help_row + 4, 0);
     printf("D-Pad: move   [A] select / unselect   [+] all   [-] none     ");
     move_cursor(help_row + 5, 0);
@@ -1174,8 +1279,9 @@ static void patch_all_179(void)
         }
     }
 
-    printf("\n%d patched, %d already done, %d without supported module, %d without backup, %d not installed, %d failed.\n",
-           patched, already_done, no_module, no_backup, not_installed, failed);
+    // two lines, so the screen does not break the text in the middle of a word
+    printf("\n%d patched, %d already done, %d without supported module,\n", patched, already_done, no_module);
+    printf("%d without backup, %d not installed, %d failed.\n", no_backup, not_installed, failed);
     if (failed > 0) {
         printf("Failed: ");
         print_ios_list(failed_list, failed);
@@ -1191,21 +1297,72 @@ static void patch_all_179(void)
 
 
 // ===================================================================================
-//  8. [A] Patch for the AX88772B / C / D (the way the original tool works)
+//  8. [A] Patch for the AX88772B / C / D (the patch of the original tool)
 // ===================================================================================
 
-// Patches one IOS (from the backup on the SD card, or else from the NAND) and installs it.
-// Returns 0 patched, 1 nothing to patch (or already done), <0 error.
+// True if [-] Restore could take this IOS back once it is installed. patched_tmd is the TMD that is
+// about to be installed (already fakesigned). These are the questions find_restore_backups() asks
+// about an IOS on the NAND, asked before the install instead of after it:
+//   - is it listed as MODIFIED? In a cIOS slot only a changed ETH module that cios.c knows says so.
+//     Without it the patched IOS is listed as an untouched cIOS, and [+] Dump writes it over its
+//     own backup.
+//   - does a backup on the SD card fit it?
+static bool can_be_restored(u32 iosnr, u32 version, const signed_blob *patched_tmd, u32 tmd_size)
+{
+    if (ios_sig_class(iosnr, patched_tmd, tmd_size) != SIG_FAKE)
+        return false;
+
+    backup_match match;
+    if (backup_find(iosnr, version, patched_tmd, &match) == 0)
+        return true;
+    return backup_find_nintendo(iosnr, version, &match) == 0;
+}
+
+// The AX88772D patch for an ARM ETH module (patch_772d_arm32()) does not only look for byte patterns
+// like the other AX88772 patches. It also writes new code to fixed places of the module (0x0AE0,
+// 0x0B7C, 0x5248 and from 0x53C0 on). These are places of the IOS36-type module: the script
+// tools/ax179/build_patch36.py checks the same addresses in it. In another ARM module that has the
+// same patterns, e.g. the one of an older IOS version, other code is at these places and would be
+// overwritten, and the IOS would still be installed.
+// Returns the position of the stock IOS36-type module in the content list, -1 if there is none.
+static int find_ios36_module(const signed_blob *s_tmd)
+{
+    const tmd *t = (const tmd *)SIGNATURE_PAYLOAD(s_tmd);
+
+    for (u32 i = 0; i < t->num_contents; i++) {
+        if (ax179_is_stock_ios36_eth_hash(t->contents[i].hash))
+            return (int)i;
+    }
+    return -1;
+}
+
+// Patches one IOS and installs it. Like the AX88179 patch, it is made from the backup on the SD card
+// that fits the IOS on the NAND, never from the NAND itself. So an IOS is only patched when there is
+// a way back with [-] Restore. (This also means: an IOS with the AX88179 driver goes back to the
+// AX88772 driver, because the patch starts from the backup.)
+// Returns 0 patched, 1 nothing to patch, PATCH_NO_BACKUP, PATCH_NOT_INSTALLED, PATCH_NO_WAY_BACK,
+// PATCH_WRONG_MODULE or another negative number for an error.
 static s32 patch_772_and_install(u32 iosnr, bool mode_772d)
 {
-    s32 version = checkIOS(iosnr);
-    if (version < 0)
-        return -1;
+    Init_SD();
 
-    IOS *ios = NULL;
-    s32 ret = get_IOS(&ios, iosnr, (u32)version);
-    if (ret < 0)
-        return ret;
+    // which version is on the NAND?
+    u32 len;
+    signed_blob *nand_tmd = read_nand_tmd(iosnr, &len);
+    if (nand_tmd == NULL)
+        return PATCH_NOT_INSTALLED;
+    u32 version = tmd_version(nand_tmd);
+
+    // the backup the patch is made from (section 7)
+    backup_match match;
+    IOS *ios = read_backup(iosnr, version, nand_tmd, &match);
+    free(nand_tmd);
+    if (ios == NULL)
+        return PATCH_NO_BACKUP;
+    s32 ret;
+
+    // where the IOS36-type module is, asked now because a patch changes its hash in the TMD
+    int ios36_module = find_ios36_module(ios->tmd);
 
     // An IOS has either an ARM or a Thumb ETH module, so only one of the two finds something.
     s32 arm_ret;
@@ -1226,7 +1383,30 @@ static s32 patch_772_and_install(u32 iosnr, bool mode_772d)
         return 1;
     }
 
+    // The ARM patch for the AX88772D worked: then the content it changed has to be the IOS36-type
+    // module (see find_ios36_module()). If it was, that content no longer has the stock hash.
+    if (mode_772d && arm_ret == 0) {
+        const tmd *t = (const tmd *)SIGNATURE_PAYLOAD(ios->tmd);
+        if (ios36_module < 0 || ax179_is_stock_ios36_eth_hash(t->contents[ios36_module].hash)) {
+            write_log("IOS%u: AX88772D patch changed an ETH module it was not made for, not installed", iosnr);
+            free_IOS(&ios);
+            return PATCH_WRONG_MODULE;
+        }
+    }
+
     forge_tmd(ios->tmd);
+
+    // The two patches above look for byte patterns, not for a module with a known hash (as the
+    // AX88179 patch does). So they also patch an ETH module the rest of the tool does not know,
+    // e.g. the one of a cIOS with another base. Its backup would not fit any more, and in a cIOS
+    // slot the result would even be listed as "cIOS" instead of "MODIFIED". Only install what
+    // [-] Restore can take back.
+    if (!can_be_restored(iosnr, version, ios->tmd, ios->tmd_size)) {
+        write_log("IOS%u: the patched IOS could not be restored afterwards, not installed", iosnr);
+        free_IOS(&ios);
+        return PATCH_NO_WAY_BACK;
+    }
+
     encrypt_IOS(ios);
     ret = install_IOS(ios, false);
     free_IOS(&ios);
@@ -1239,12 +1419,15 @@ static void print_772_progress(int done, int total)
     printf("Patching all relevant IOS's... (%d/%d)\n\n", done, total);
 }
 
+// All IOS of the list, the cIOS of USB loaders too (they carry the ETH module of their base IOS).
 static void patch_all_772(bool mode_772d)
 {
     int total = (int)plat_ios_count;
     int patched = 0;
     int skipped = 0;
+    int no_backup = 0;
     int failed = 0;
+    u32 no_backup_list[MAX_IOS];
     u32 failed_list[MAX_IOS];
 
     write_log("patch for %s, installs right away", adapter_name());
@@ -1256,6 +1439,9 @@ static void patch_all_772(bool mode_772d)
 
         if (ret == 0) {
             patched++;
+        } else if (ret == PATCH_NO_BACKUP) {
+            no_backup_list[no_backup] = plat_ios[i];
+            no_backup++;
         } else if (ret > 0) {
             skipped++;
         } else {
@@ -1263,15 +1449,23 @@ static void patch_all_772(bool mode_772d)
             failed++;
         }
 
-        print_772_progress(patched + skipped + failed, total);
+        print_772_progress(patched + skipped + no_backup + failed, total);
     }
 
     clear_screen();
-    if (failed == 0)
-        printf("Patching complete!\n");
-    else
+    if (failed > 0)
         printf("Patching finished with %d failures.\n", failed);
-    printf("\n%d patched, %d already done, %d failed.\n", patched, skipped, failed);
+    else if (no_backup > 0)
+        printf("Patching finished, %d IOS not patched (no backup).\n", no_backup);
+    else
+        printf("Patching complete!\n");
+    printf("\n%d patched, %d already done, %d without backup, %d failed.\n", patched, skipped, no_backup, failed);
+    if (no_backup > 0) {
+        printf("\nNo matching backup in %s/: ", plat_wad_dir());
+        print_ios_list(no_backup_list, no_backup);
+        printf("\nDump with [+] first. An IOS that is already patched needs a stock backup\n");
+        printf("of the same version (see \"No backup\" in the README).\n");
+    }
     if (failed > 0) {
         printf("\nFailed: ");
         print_ios_list(failed_list, failed);
@@ -1299,6 +1493,13 @@ static bool patch_menu(void)
             printf("%s\n%s\n\n", AX179A_HINT_1, AX179A_HINT_2);
         else
             printf("The driver links at 10/100M (gigabit was unreliable in tests).\n\n");
+    } else {
+        printf("AX88772: every IOS is built from the backup in %s/ that matches\n", plat_wad_dir());
+        printf("the IOS on the NAND, and installed right away. An IOS without a matching\n");
+        printf("backup is not patched: dump with [+] first.\n\n");
+        if (mode_772d)
+            printf("The AX88772D patch is experimental (the original tool says so, too) and\n"
+                   "was not tested by this fork.\n\n");
     }
     printf("Press A to start, anything else to go back.\n");
 
@@ -1350,18 +1551,22 @@ static s32 connect_to_ipify(void)
         return -1;
     }
 
+    // The answer comes from the network, so it is not trusted: an answer without an address would
+    // be read from a NULL pointer (a crash on the console).
     struct hostent *host = net_gethostbyname("api.ipify.org");
-    if (host == NULL || host->h_length <= 0) {
+    if (host == NULL || host->h_length <= 0 || host->h_addr_list == NULL || host->h_addr_list[0] == NULL) {
         printf("(DNS failed)\n");
         net_close(sock);
         return -1;
     }
 
+    // An IPv4 address has 4 bytes. Exactly these are copied, whatever length the answer claims:
+    // a larger one would be written past the end of address.
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_port = 80;       // the Wii is big-endian, so no htons() is needed
-    memcpy(&address.sin_addr, host->h_addr_list[0], host->h_length);
+    memcpy(&address.sin_addr, host->h_addr_list[0], sizeof(address.sin_addr));
 
     if (net_connect(sock, (struct sockaddr *)&address, sizeof(address)) < 0) {
         printf("(connect failed)\n");
@@ -1432,6 +1637,12 @@ static void print_public_ip(void)
         "Connection: close\r\n\r\n";
     net_send(sock, request, strlen(request), 0);
 
+    // read_answer() gives up when nothing comes for 5 seconds. For that net_recv() has to return
+    // at once when there is no data yet. On a blocking socket it waits inside the IOS instead,
+    // without a limit, as long as the server neither answers nor closes the connection.
+    u32 nonblocking = 1;
+    net_ioctl(sock, FIONBIO, &nonblocking);
+
     char answer[512];
     read_answer(sock, answer, sizeof(answer));
     net_close(sock);
@@ -1449,25 +1660,128 @@ static void print_public_ip(void)
         printf("%s\n", ip);
 }
 
+// true if the IOS58 on the NAND was changed by this tool (it then has the driver of one adapter only)
+static bool ios58_is_modified(void)
+{
+    for (u32 k = 0; k < plat_ios_count; k++) {
+        if (plat_ios[k] == IOS58_NR)
+            return ios_state[k].signature == SIG_FAKE;
+    }
+    return false;
+}
+
+// What the user can do when the network does not start. The adapter was found in the main menu
+// (before the IOS reload), so adapter_name() still knows it.
+// net is the result of the failed start (0 if the IOS did not answer at all). -ETIMEDOUT means libogc
+// waited for the link and an IP address and got none: with an IOS58 that is patched this is first of
+// all a cable or DHCP problem, even when it is patched for the right adapter.
+static void print_network_hint(s32 net)
+{
+    if (adapter_pid == 0) {
+        printf("No ASIX adapter was found. Plug it in and try again.\n");
+    } else if (adapter_pid == PID_772A) {
+        printf("Adapter: %s. Check the cable and the router (DHCP).\n", adapter_name());
+    } else if (is_patchable()) {
+        printf("Adapter: %s.\n", adapter_name());
+        if (!ios58_is_modified()) {
+            // This adapter never works with an IOS58 that is not patched, whatever the error is.
+            // (Without a driver for it the start ends with -ETIMEDOUT too, so this comes first:
+            // otherwise the first test before patching would only say "check the cable".)
+            printf("IOS58 must be patched for it ([A] in the menu). Check the cable too.\n");
+        } else if (net == -ETIMEDOUT) {
+            printf("No link or no IP address: check the cable and the router (DHCP).\n");
+            printf("If the cable is fine: IOS58 may be patched for another adapter ([A]).\n");
+        } else {
+            printf("IOS58 is patched, maybe for another adapter. Patch it for this one ([A]).\n");
+        }
+    } else {
+        printf("Adapter: %s - this adapter is not supported (see README).\n", adapter_name());
+    }
+}
+
+// How long the IOS may stay silent while the network starts. libogc itself waits about 20 s at most
+// for the link and an IP address and then reports an error, so a start that is silent for longer is
+// stuck inside the IOS (e.g. the ETH module waits for an adapter it does not know).
+#ifndef NET_ANSWER_TIMEOUT_MS
+#define NET_ANSWER_TIMEOUT_MS 40000
+#endif
+
+// How long failed starts are repeated. A start that fails at once is tried again 0.2 s later (50
+// tries = 10 s). But when no IP address comes (cable not plugged in, no DHCP server) libogc itself
+// only gives up after about 10 s: repeating that 50 times left the screen without any reaction for
+// more than 8 minutes. So no new try is started after this time; the user can retry with [B].
+#ifndef NET_RETRY_WINDOW_MS
+#define NET_RETRY_WINDOW_MS 30000
+#endif
+
+// set when the IOS did not answer: the network test cannot go on and the IOS has to be reloaded
+static bool network_hung = false;
+
+// One start of the network: returns 0 if it runs and a negative number if it failed.
+// *no_answer is set if the IOS did not answer in time. net_init() would wait for ever instead,
+// it sleeps until the IOS answers, so a stuck IOS would freeze the patcher.
+// *waited_ms is set to the time the start took.
+static s32 start_network(bool *no_answer, int *waited_ms)
+{
+    *no_answer = false;
+    *waited_ms = 0;
+
+    s32 ret = net_init_async(NULL, NULL);
+    if (ret < 0)
+        return ret;
+
+    for (int waited = 0; waited < NET_ANSWER_TIMEOUT_MS; waited += 100) {
+        s32 status = net_get_status();      // -EBUSY as long as the start is running
+        if (status != -EBUSY)
+            return status;
+        usleep(100000);
+        *waited_ms = waited + 100;
+    }
+    *no_answer = true;
+    return -EBUSY;
+}
+
 // one try: start the network, print the local and the public IP, stop the network again
 static void network_try(void)
 {
     printf("\nInitializing network");
 
-    // net_init() can need a few tries (up to 10 s)
+    // a start can fail at first and work a moment later: up to 50 tries, 0.2 s apart,
+    // but no new try after NET_RETRY_WINDOW_MS
     s32 net = -1;
+    bool no_answer = false;
+    int total_ms = 0;            // how long all tries took so far
     for (int i = 0; i < 50; i++) {
-        net = net_init();
-        if (net == 0)
+        int waited_ms = 0;
+        net = start_network(&no_answer, &waited_ms);
+        if (net == 0 || no_answer)
+            break;
+
+        total_ms += waited_ms + 200;
+        if (total_ms >= NET_RETRY_WINDOW_MS)
             break;
         if (i % 5 == 0)
             printf(".");
         usleep(200000);
     }
 
+    if (no_answer) {
+        // Do not call net_deinit() here: it waits for the answer that never comes. The IOS is
+        // reloaded when the patcher ends, which ends the stuck start too.
+        network_hung = true;
+        printf("\nThe IOS does not answer (%d s).\n", NET_ANSWER_TIMEOUT_MS / 1000);
+        print_network_hint(0);
+        write_log("network test: no answer from the IOS (adapter pid %04X bcd %04X product '%s')",
+                  adapter_pid, adapter_bcd, adapter_product);
+        return;
+    }
+
     if (net < 0) {
-        printf("\nNetwork init failed: %d\n", net);
-        printf("Make sure the adapter is plugged in.\n");
+        net_deinit();            // stop a start that may still be running, so nothing is left behind
+        printf("\nNetwork init failed: %d\n", (int)net);
+        print_network_hint(net);
+        write_log("network test: init failed %d (adapter pid %04X bcd %04X product '%s')",
+                  (int)net, adapter_pid, adapter_bcd, adapter_product);
         return;
     }
 
@@ -1480,6 +1794,7 @@ static void network_try(void)
         int c = (ip >> 8) & 0xFF;
         int d = ip & 0xFF;
         printf("\nLocal: %d.%d.%d.%d\n", a, b, c, d);
+        write_log("network test: ok, local IP %d.%d.%d.%d", a, b, c, d);
         print_public_ip();
     }
     net_deinit();
@@ -1492,11 +1807,20 @@ static void network_test(void)
 {
     clear_screen();
     printf("\nReloading IOS58...\n");
+    write_log("network test on IOS58");
+
+    // Close everything that has a handle in the old IOS. libogc keeps these handles across a
+    // reload, and in the new IOS the same numbers belong to other devices: closing or using
+    // them later (e.g. when leaving the patcher) hits the wrong device and can freeze the console.
+    Close_SD();
+    ISFS_Deinitialize();
     WPAD_Shutdown();
+    USB_Deinitialize();
+
     Patch_AHB();                 // keep AHBPROT after the reload
-    USB_Deinitialize();          // otherwise libogc keeps the USB handle of the old IOS
     IOS_ReloadIOS(IOS58_NR);
     USB_Initialize();
+    Init_SD();                   // fresh handle in IOS58, for the log
 
     PAD_Init();
     WPAD_Init();
@@ -1506,6 +1830,11 @@ static void network_test(void)
     for (;;) {
         network_try();
 
+        if (network_hung) {          // a retry would wait for the same IOS
+            printf("\nPress any button to leave the patcher.\n");
+            get_button();
+            break;
+        }
         printf("\nPress B to retry, any other button to leave the patcher.\n");
         if (get_button() != WPAD_BUTTON_B)
             break;
@@ -1546,7 +1875,9 @@ static void draw_patch_line(void)
 {
     char line[64];
 
-    if (is_patchable())
+    if (is_patchable() && adapter_pid == PID_772D && !is_ax179())
+        snprintf(line, sizeof(line), "[A]     Patch for %s (experimental)", adapter_name());
+    else if (is_patchable())
         snprintf(line, sizeof(line), "[A]     Patch for %s", adapter_name());
     else if (adapter_pid == PID_772A)
         snprintf(line, sizeof(line), "[A]     You don't need to patch, silly!");
@@ -1629,10 +1960,14 @@ static void draw_ios_status(void)
             printf(" ");
     }
 
-    // the explanation of "custom" goes below the last line of the list
+    // the explanation of "custom" (and "cIOS") goes below the last line of the list
     int list_lines = ((int)plat_ios_count + 3) / 4;
     move_cursor(ROW_IOS_LIST + 1 + list_lines, 0);
     printf("custom = not signed by Nintendo (e.g. WiiLink)");
+    if (list_has_cios()) {
+        move_cursor(ROW_IOS_LIST + 2 + list_lines, 0);
+        printf("cIOS   = IOS of a USB loader (e.g. d2x), its changes are kept");
+    }
 }
 
 static void draw_main_screen(void)
@@ -1641,8 +1976,9 @@ static void draw_main_screen(void)
     if (plat_is_vwii())
         console = "Wii U (vWii)";
 
+    // the title says what this console is: "Wii Ethernet Patcher" or "vWii Ethernet Patcher"
     clear_screen();
-    printf("=== vWii Ethernet Patcher " VERSION " ===   console: %s\n\n", console);
+    printf("=== %s Ethernet Patcher " VERSION " ===   console: %s\n\n", plat_name(), console);
     printf("[+]     Dump IOS to %s/ (do this first!)\n", plat_wad_dir());
     printf("[A]     Patch\n");
     printf("[B]     Test network\n");
@@ -1732,13 +2068,11 @@ static void get_hardware_access(void)
 // [B]: runs the network test and then ends the patcher. The network test leaves the network of the
 // IOS running, which takes the adapter away from the USB list after about a minute. So the menu could
 // not use the adapter any more.
+// Nothing is written to the NAND after the test, so the NAND is not opened again: shut_down() only
+// has to unmount the SD card that network_test() mounted.
 static void test_network_and_leave(void)
 {
     network_test();
-    if (have_ahbprot()) {
-        Patch_AHB();
-        reinit_nand();
-    }
     printf("\nLeaving the patcher...\n");
 }
 
@@ -1750,7 +2084,8 @@ static void shut_down(void)
 
     // leave with a freshly loaded IOS58, to be safe (nothing is written after this)
     WPAD_Shutdown();
-    USB_Deinitialize();
+    if (!network_hung)           // after a stuck network start the IOS may not answer USB calls either
+        USB_Deinitialize();
     IOS_ReloadIOS(IOS58_NR);
 
     Reboot();
@@ -1777,9 +2112,10 @@ int main(int argc, char *argv[])
     printf("Reading the IOS on the NAND and the backups on the SD card...\n");
     refresh_status();
 
-    // in the AX88179 IOS list every IOS is ticked at the start
-    for (int k = 0; k < MAX_IOS; k++)
-        ios_selected[k] = true;
+    // In the AX88179 IOS list every IOS is ticked at the start, except a cIOS: patching one is
+    // new in this version, so it is only done when it is ticked by hand.
+    for (u32 k = 0; k < plat_ios_count; k++)
+        ios_selected[k] = !cios_is_slot(plat_ios[k]);
 
     // the main loop: show the main screen, wait for a button, do what the button says
     for (;;) {

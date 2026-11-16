@@ -15,7 +15,8 @@ const char *plat_name(void);
 const char *plat_wad_dir(void);
 
 // The IOS this console works with (dump, patch, show on the screen).
-// plat_init() fills the list.
+// plat_init() fills the list: the 20 IOS with an ETH module, then the installed cIOS.
+#define PLAT_MAX_IOS 32
 extern u32 plat_ios[];
 extern u32 plat_ios_count;
 void plat_init(void);

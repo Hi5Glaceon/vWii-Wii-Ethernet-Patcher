@@ -161,6 +161,7 @@ s32 Nand_Read_into_memory(IOS **ios, u32 iosnr, u32 revision)
 		(*ios)->decrypted_buffer[count] = MEM2_memalign(32, (*ios)->buffer_size[count]);
 		if((*ios)->decrypted_buffer[count] == NULL)
 		{
+			free(tmp_buf);	// free_IOS() does not know this buffer
 			ret = -1;
 			goto error;
 		}

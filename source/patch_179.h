@@ -25,4 +25,13 @@ s32 patch_179(IOS *ios);
 // true if sha1 is the hash of one of the stock ETH modules this tool knows
 bool ax179_is_stock_eth_hash(const u8 *sha1);
 
+// true if sha1 is the hash of the stock IOS36-type ETH module (the only one with ARM code)
+bool ax179_is_stock_ios36_eth_hash(const u8 *sha1);
+
+// true if sha1 is the hash of an ETH module with the AX88179 driver of this tool
+bool ax179_is_patched_eth_hash(const u8 *sha1);
+
+// true if a content of this size can be one of the stock ETH modules (a patch does not change the size)
+bool ax179_is_eth_size(u32 size);
+
 #endif

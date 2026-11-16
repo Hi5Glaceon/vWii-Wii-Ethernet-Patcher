@@ -1,10 +1,11 @@
 // IOS backups on the SD card
 //
 // Every console keeps its backups in its own folder: sd:/wad/wii or sd:/wad/vwii.
-// There are three kinds of backup files:
+// There are four kinds of backup files:
 //   stock   IOSn-64-vV.wad          the IOS as Nintendo made it
 //   custom  IOSn-64-vV-custom.wad   an IOS another tool changed (e.g. the WiiLink IOS31 / IOS80)
 //   legacy  sd:/wad/IOSn-64-vV.wad  written by the original tool and older versions, only read
+//   cIOS    IOSn-64-vV-cios.wad     a cIOS of a USB loader (e.g. IOS249-64-v65535-cios.wad)
 //
 // The file name alone never decides which backup is used. backup_find() compares the list of
 // contents (the TMD) of a backup with the TMD of the IOS on the NAND.
@@ -16,9 +17,13 @@
 #include "backup.h"
 #include "platform.h"
 #include "sigcheck.h"
+#include "cios.h"
 #include "patch_179.h"
 #include "tools.h"
 #include "memory/mem2.hpp"
+
+// every kind of backup file, in the order they are looked at
+static const int all_kinds[4] = { BK_STOCK, BK_CUSTOM, BK_LEGACY, BK_CIOS };
 
 // size of a TMD without contents, and of one content entry
 #define TMD_HEADER_SIZE  0x1e4
@@ -51,6 +56,8 @@ void backup_path(char *out, size_t size, int kind, u32 iosnr, u32 ver)
         snprintf(out, size, "%s/IOS%u-64-v%u-custom.wad", plat_wad_dir(), iosnr, ver);
     else if (kind == BK_LEGACY)
         snprintf(out, size, "sd:/wad/IOS%u-64-v%u.wad", iosnr, ver);
+    else if (kind == BK_CIOS)
+        snprintf(out, size, "%s/IOS%u-64-v%u-cios.wad", plat_wad_dir(), iosnr, ver);
     else
         out[0] = 0;
 }
@@ -63,6 +70,8 @@ const char *backup_kind_name(int kind)
         return "custom";
     if (kind == BK_LEGACY)
         return "old sd:/wad/";
+    if (kind == BK_CIOS)
+        return "cIOS";
     return "none";
 }
 
@@ -83,7 +92,11 @@ static bool header_ok(const bk_wad_header *h)
 // true if the TMD belongs to IOS iosnr in version ver and fits into len bytes
 static bool tmd_ok(signed_blob *s, u32 len, u32 iosnr, u32 ver)
 {
-    if (!IS_VALID_SIGNATURE(s))
+    // Every IOS TMD has an RSA-2048 signature (0x140 bytes), and the sizes used here, in sigcheck.c
+    // and in cios.c (0x1e4 + 36 per content) are only right for it. With one of the other two types
+    // libogc knows, the TMD starts at another place: after an RSA-4096 signature (0x240 bytes) it
+    // would be read up to 0x100 bytes past the end of the buffer.
+    if (*s != ES_SIG_RSA2048)
         return false;
 
     tmd *t = (tmd *)SIGNATURE_PAYLOAD(s);
@@ -187,6 +200,8 @@ static bool backup_fits(int kind, int sig, int diff, bool eth_only)
         return false;                 // a patched WAD is never used as a base
     if (kind == BK_STOCK && sig != SIG_NINTENDO)
         return false;                 // the stock file name promises a stock IOS
+    if ((kind == BK_CIOS) != (sig == SIG_CIOS))
+        return false;                 // a cIOS only in a cIOS file, and a cIOS file only with a cIOS
     if (diff < 0 || diff > 1)
         return false;                 // different layout, or more than one content differs
     if (diff == 1 && !eth_only)
@@ -195,23 +210,23 @@ static bool backup_fits(int kind, int sig, int diff, bool eth_only)
 }
 
 // Finds the backup the IOS on the NAND was made from. A backup fits if
-//   - it is not patched itself (not fakesigned),
+//   - it is not patched itself (not fakesigned, except a cIOS that nobody patched),
 //   - a file called "stock" really is signed by Nintendo,
+//   - a file called "cios" really is a cIOS, and a cIOS is only taken from such a file,
 //   - all its contents are the same as on the NAND, or only the ETH module is different
 //     (then the NAND has the patched one).
-// Stock is looked at first, then custom, then legacy. A backup with no difference at all wins
-// over one where the ETH module is different.
+// Stock is looked at first, then custom, then legacy, then cIOS. A backup with no difference at
+// all wins over one where the ETH module is different.
 s32 backup_find(u32 iosnr, u32 ver, const signed_blob *nand_tmd, backup_match *out)
 {
-    int kinds[3] = { BK_STOCK, BK_CUSTOM, BK_LEGACY };
     backup_match best;
     int best_diff = 99;               // number of differences of the best backup so far (99 = none yet)
-    char note[96] = "";               // for the log: what was found in every backup file
+    char note[128] = "";              // for the log: what was found in every backup file
 
     best.kind = BK_NONE;
 
-    for (int k = 0; k < 3; k++) {
-        int kind = kinds[k];
+    for (int k = 0; k < 4; k++) {
+        int kind = all_kinds[k];
         char path[80];
         backup_path(path, sizeof(path), kind, iosnr, ver);
 
@@ -220,7 +235,7 @@ s32 backup_find(u32 iosnr, u32 ver, const signed_blob *nand_tmd, backup_match *o
         if (wad_read_tmd(path, iosnr, ver, &t, &len) < 0)
             continue;                 // no such file (or not readable)
 
-        int sig = tmd_sig_class(t, len);
+        int sig = ios_sig_class(iosnr, t, len);      // stock, custom, MODIFIED or cIOS
         bool eth_only = false;
         int diff = tmd_diff(nand_tmd, t, &eth_only);
         free(t);
@@ -280,6 +295,30 @@ s32 backup_find_nintendo(u32 iosnr, u32 ver, backup_match *out)
         out->sig = sig;
         strcpy(out->path, path);
         return 0;
+    }
+    return -1;
+}
+
+// Finds a backup file of this IOS that is itself patched (MODIFIED). That happens when an IOS is
+// dumped after it was patched, e.g. with an older tool. Such a file can never bring back the IOS
+// as it was before patching, so it is never used. 0 found (its path in out), -1 none
+s32 backup_find_patched_copy(u32 iosnr, u32 ver, char *out, size_t size)
+{
+    for (int k = 0; k < 4; k++) {
+        char path[80];
+        backup_path(path, sizeof(path), all_kinds[k], iosnr, ver);
+
+        signed_blob *t = NULL;
+        u32 len = 0;
+        if (wad_read_tmd(path, iosnr, ver, &t, &len) < 0)
+            continue;
+
+        int sig = ios_sig_class(iosnr, t, len);
+        free(t);
+        if (sig == SIG_FAKE) {
+            snprintf(out, size, "%s", path);
+            return 0;
+        }
     }
     return -1;
 }

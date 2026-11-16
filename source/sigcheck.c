@@ -5,6 +5,8 @@
 //             a changed IOS ("fakesigning").
 //   custom    some other signature that is not Nintendo's, e.g. the WiiLink IOS31 and IOS80.
 //
+// A cIOS (USB loader) is fakesigned too. cios.c tells it apart from MODIFIED by its ETH module.
+//
 // To check a signature it is "decrypted" with Nintendo's public key (RSA). For a real signature
 // the result is a fixed pattern followed by the SHA-1 hash of the TMD. The decryption is
 //
@@ -228,5 +230,7 @@ const char *sig_class_name(int c)
         return "stock";
     if (c == SIG_FAKE)
         return "MODIFIED";
+    if (c == SIG_CIOS)
+        return "cIOS";
     return "custom";
 }
